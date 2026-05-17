@@ -14,6 +14,7 @@ export interface ReverseProxyConfig {
 	includeAllRequests?: boolean;
 	openBrowser?: boolean;
 	logSensitiveHeaders?: boolean;
+	upstreamBaseUrl?: string;
 }
 
 export class ReverseProxyServer {
@@ -23,8 +24,7 @@ export class ReverseProxyServer {
 	private logFile: string;
 	private htmlFile: string;
 	private htmlGenerator: HTMLGenerator;
-	private targetHost = "api.anthropic.com";
-	private targetPort = 443;
+	private upstreamUrl: URL;
 
 	constructor(config: ReverseProxyConfig = {}) {
 		this.config = {
@@ -34,7 +34,9 @@ export class ReverseProxyServer {
 			includeAllRequests: config.includeAllRequests || false,
 			openBrowser: config.openBrowser || false,
 			logSensitiveHeaders: config.logSensitiveHeaders || false,
+			upstreamBaseUrl: config.upstreamBaseUrl || "https://api.anthropic.com",
 		};
+		this.upstreamUrl = new URL(this.config.upstreamBaseUrl);
 
 		// Create log directory if needed
 		if (!fs.existsSync(this.config.logDirectory)) {
@@ -171,19 +173,22 @@ export class ReverseProxyServer {
 		});
 
 		req.on("end", () => {
-			// Forward the request to the real Anthropic API
+			// Forward the request to the configured upstream API.
+			const upstreamPath = this.buildUpstreamPath(req.url || "/");
 			const options: https.RequestOptions = {
-				hostname: this.targetHost,
-				port: this.targetPort,
-				path: req.url,
+				protocol: this.upstreamUrl.protocol,
+				hostname: this.upstreamUrl.hostname,
+				port: this.upstreamUrl.port || (this.upstreamUrl.protocol === "http:" ? 80 : 443),
+				path: upstreamPath,
 				method: req.method,
 				headers: {
 					...req.headers,
-					host: this.targetHost,
+					host: this.upstreamUrl.host,
 				},
 			};
 
-			const proxyReq = https.request(options, (proxyRes) => {
+			const request = this.upstreamUrl.protocol === "http:" ? http.request : https.request;
+			const proxyReq = request(options, (proxyRes) => {
 				const responseTimestamp = Date.now();
 				const responseChunks: Buffer[] = [];
 
@@ -196,9 +201,8 @@ export class ReverseProxyServer {
 					res.end();
 
 					// Check if this is a request we should log
-					const url = `https://${this.targetHost}${req.url}`;
-					const shouldLog =
-						this.config.includeAllRequests || (req.url && req.url.includes("/v1/messages"));
+					const url = new URL(upstreamPath, this.upstreamUrl.origin).toString();
+					const shouldLog = this.config.includeAllRequests || (req.url && req.url.includes("/v1/messages"));
 
 					if (shouldLog) {
 						// Parse request body
@@ -260,9 +264,7 @@ export class ReverseProxyServer {
 							response: {
 								timestamp: responseTimestamp / 1000,
 								status_code: proxyRes.statusCode || 0,
-								headers: this.processHeaders(
-									proxyRes.headers as Record<string, string>,
-								),
+								headers: this.processHeaders(proxyRes.headers as Record<string, string>),
 								...parsedResponseBody,
 							},
 							logged_at: new Date().toISOString(),
@@ -290,6 +292,12 @@ export class ReverseProxyServer {
 			}
 			proxyReq.end();
 		});
+	}
+
+	private buildUpstreamPath(requestUrl: string): string {
+		const upstreamBasePath = this.upstreamUrl.pathname.replace(/\/$/, "");
+		const normalizedRequestPath = requestUrl.startsWith("/") ? requestUrl : `/${requestUrl}`;
+		return `${upstreamBasePath}${normalizedRequestPath}` || "/";
 	}
 
 	public stop(): void {

@@ -3,6 +3,7 @@
 import { spawn, ChildProcess } from "child_process";
 import * as path from "path";
 import * as fs from "fs";
+import * as os from "os";
 import { HTMLGenerator } from "./html-generator";
 import { ReverseProxyServer } from "./reverse-proxy";
 
@@ -186,14 +187,11 @@ function findClaudePath(customPath?: string): string {
 		return customPath;
 	}
 
-	const os = require("os");
 	const isWindows = process.platform === "win32";
 
 	try {
 		const findCmd = isWindows ? "where claude" : "which claude";
-		let claudePath = require("child_process")
-			.execSync(findCmd, { encoding: "utf-8" })
-			.trim();
+		let claudePath = require("child_process").execSync(findCmd, { encoding: "utf-8" }).trim();
 
 		// Windows 'where' can return multiple lines, take the first
 		if (isWindows && claudePath.includes("\n")) {
@@ -211,17 +209,17 @@ function findClaudePath(customPath?: string): string {
 		// Check common installation locations
 		const possiblePaths = isWindows
 			? [
-				path.join(os.homedir(), ".local", "bin", "claude.exe"),
-				path.join(process.env.APPDATA || "", "npm", "claude.cmd"),
-			]
+					path.join(os.homedir(), ".local", "bin", "claude.exe"),
+					path.join(process.env.APPDATA || "", "npm", "claude.cmd"),
+				]
 			: [
-				path.join(os.homedir(), ".claude", "bin", "claude"),
-				path.join(os.homedir(), ".claude", "local", "claude"),
-				path.join(os.homedir(), ".local", "bin", "claude"),
-				"/opt/homebrew/bin/claude",
-				"/usr/local/bin/claude",
-				"/usr/bin/claude",
-			];
+					path.join(os.homedir(), ".claude", "bin", "claude"),
+					path.join(os.homedir(), ".claude", "local", "claude"),
+					path.join(os.homedir(), ".local", "bin", "claude"),
+					"/opt/homebrew/bin/claude",
+					"/usr/local/bin/claude",
+					"/usr/bin/claude",
+				];
 
 		for (const p of possiblePaths) {
 			if (fs.existsSync(p)) {
@@ -233,6 +231,53 @@ function findClaudePath(customPath?: string): string {
 		log(`Please install Claude Code CLI first`, "red");
 		process.exit(1);
 	}
+}
+
+interface ClaudeSettings {
+	env?: Record<string, string>;
+}
+
+function getClaudeSettingsPath(): string {
+	const configDir =
+		process.env.CLAUDE_CONFIG_DIR || process.env.ANTHROPIC_CONFIG_DIR || path.join(os.homedir(), ".claude");
+	return path.join(configDir, "settings.json");
+}
+
+function readClaudeSettingsEnv(filePath: string): Record<string, string> {
+	try {
+		if (!fs.existsSync(filePath)) {
+			return {};
+		}
+
+		const settings = JSON.parse(fs.readFileSync(filePath, "utf-8")) as ClaudeSettings;
+		return settings.env ?? {};
+	} catch {
+		return {};
+	}
+}
+
+function getConfiguredAnthropicBaseUrl(): string {
+	const userSettingsEnv = readClaudeSettingsEnv(getClaudeSettingsPath());
+	const projectSettingsEnv = readClaudeSettingsEnv(path.join(process.cwd(), ".claude", "settings.json"));
+	const localSettingsEnv = readClaudeSettingsEnv(path.join(process.cwd(), ".claude", "settings.local.json"));
+
+	return (
+		localSettingsEnv.ANTHROPIC_BASE_URL ||
+		projectSettingsEnv.ANTHROPIC_BASE_URL ||
+		userSettingsEnv.ANTHROPIC_BASE_URL ||
+		process.env.ANTHROPIC_BASE_URL ||
+		"https://api.anthropic.com"
+	);
+}
+
+function withProxySettings(claudeArgs: string[], proxyUrl: string): string[] {
+	const proxySettings = JSON.stringify({
+		env: {
+			ANTHROPIC_BASE_URL: proxyUrl,
+		},
+	});
+
+	return [...claudeArgs, "--settings", proxySettings];
 }
 
 function getLoaderPath(): string {
@@ -303,12 +348,16 @@ async function runClaudeNativeWithProxy(
 	log("Using reverse proxy mode for native binary", "yellow");
 	console.log("");
 
+	const upstreamBaseUrl = getConfiguredAnthropicBaseUrl();
+	log(`Upstream target: ${upstreamBaseUrl}`, "blue");
+
 	// Start the reverse proxy
 	const proxy = new ReverseProxyServer({
 		logBaseName: logBaseName,
 		includeAllRequests: includeAllRequests,
 		openBrowser: openInBrowser,
 		logSensitiveHeaders: logSensitiveHeaders,
+		upstreamBaseUrl,
 	});
 
 	let proxyInfo: { port: number; url: string };
@@ -324,7 +373,7 @@ async function runClaudeNativeWithProxy(
 
 	// Spawn Claude with ANTHROPIC_BASE_URL pointing to our HTTP proxy
 	// Using HTTP avoids TLS certificate issues with Bun binaries
-	const child: ChildProcess = spawn(claudePath, claudeArgs, {
+	const child: ChildProcess = spawn(claudePath, withProxySettings(claudeArgs, proxyInfo.url), {
 		env: {
 			...process.env,
 			ANTHROPIC_BASE_URL: proxyInfo.url,
@@ -400,7 +449,14 @@ async function runClaudeWithInterception(
 	// Check if this is a native binary (ELF, Mach-O, PE)
 	if (isNativeBinary(claudePath)) {
 		log("Detected native binary", "yellow");
-		await runClaudeNativeWithProxy(claudePath, claudeArgs, includeAllRequests, openInBrowser, logBaseName, logSensitiveHeaders);
+		await runClaudeNativeWithProxy(
+			claudePath,
+			claudeArgs,
+			includeAllRequests,
+			openInBrowser,
+			logBaseName,
+			logSensitiveHeaders,
+		);
 		return;
 	}
 
@@ -691,7 +747,14 @@ async function main(): Promise<void> {
 	}
 
 	// Scenario 1: No args (or claude with args) -> launch claude with interception
-	await runClaudeWithInterception(claudeArgs, includeAllRequests, openInBrowser, customClaudePath, logBaseName, logSensitiveHeaders);
+	await runClaudeWithInterception(
+		claudeArgs,
+		includeAllRequests,
+		openInBrowser,
+		customClaudePath,
+		logBaseName,
+		logSensitiveHeaders,
+	);
 }
 
 main().catch((error) => {
